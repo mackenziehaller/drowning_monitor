@@ -1,0 +1,12 @@
+{
+  "_readme": "Permanent corrections applied after every pipeline run. Add entries here to fix wrong dates, locations, outcomes etc. Keyed by URL (preferred) or 'date|location' fallback. Run: python correct.py to add/list corrections.",
+  "corrections": [
+    {
+      "match_fallback": "2026-04-18|phillip island",
+      "reason": "Article refers to Saturday which was 19 April not 18 April",
+      "fields": {
+        "date_of_incident": "2026-04-19"
+      }
+    }
+  ]
+}

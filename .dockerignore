@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+chroma_db/
+pdf_cache/
+*.db
+*.sqlite
