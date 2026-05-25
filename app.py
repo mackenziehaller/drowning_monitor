@@ -1,5 +1,7 @@
 import sqlite3
 import os
+import subprocess
+import sys
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -28,6 +30,29 @@ if APP_PASSWORD:
 
 st.title("🌊 Drowning Cases Explorer")
 st.caption("Australian drowning incident monitor — powered by Google Gemini + SQLite")
+
+# ── Run Pipeline button ───────────────────────────────────────────
+with st.sidebar:
+    st.header("Pipeline")
+    st.caption("Search Google News for new Australian drowning cases from the past 72 hours.")
+    if st.button("🔍 Run Pipeline Now", use_container_width=True, type="primary"):
+        with st.spinner("Searching Google News and classifying cases... this takes 1-2 minutes."):
+            try:
+                result = subprocess.run(
+                    [sys.executable, "run_pipeline.py"],
+                    capture_output=True,
+                    text=True,
+                    cwd=os.path.dirname(os.path.abspath(__file__))
+                )
+                if result.returncode == 0:
+                    st.success("Pipeline complete! Refresh the page to see new cases.")
+                    st.code(result.stdout[-3000:] if len(result.stdout) > 3000 else result.stdout)
+                else:
+                    st.error("Pipeline failed.")
+                    st.code(result.stderr[-3000:] if len(result.stderr) > 3000 else result.stderr)
+            except Exception as e:
+                st.error(f"Could not run pipeline: {e}")
+    st.markdown("---")
 
 # ── Helpers ───────────────────────────────────────────────────────
 
