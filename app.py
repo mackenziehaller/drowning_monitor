@@ -1,17 +1,14 @@
-import json
 import sqlite3
-import ollama
+import os
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from config import DB_PATH, OLLAMA_MODEL, APP_PASSWORD
+from dotenv import load_dotenv
 
-# RAG is optional — app still works if chroma_db hasn't been built yet
-try:
-    from rag_query import ask as rag_ask, search as rag_search
-    RAG_AVAILABLE = True
-except Exception:
-    RAG_AVAILABLE = False
+load_dotenv()
+
+DB_PATH = os.getenv("DB_PATH", "drowning_cases.db")
+APP_PASSWORD = os.getenv("APP_PASSWORD", "")
 
 st.set_page_config(page_title="Drowning Cases Explorer", layout="wide")
 
@@ -20,36 +17,17 @@ if APP_PASSWORD:
     if not st.session_state.get("authenticated"):
         st.title("Drowning Cases Explorer")
         st.markdown("---")
-        with st.container(border=True):
-            st.markdown("#### 🔒 Login required")
-            label_col, badge_col = st.columns([4, 1])
-            with label_col:
-                pwd = st.text_input(
-                    "Password",
-                    type="password",
-                    placeholder="Enter app password",
-                    help="Masked — your keystrokes are hidden and never displayed on screen.",
-                    label_visibility="visible",
-                )
-            with badge_col:
-                st.markdown("<br>", unsafe_allow_html=True)
-                st.markdown(
-                    '<span title="Masked" style="background:#c0392b;color:white;'
-                    'padding:4px 10px;border-radius:6px;font-size:0.8em;'
-                    'font-weight:bold;letter-spacing:0.05em;">MASKED</span>',
-                    unsafe_allow_html=True,
-                )
-            st.caption("The dots shown while typing are a **mask** — your password is never displayed in plain text.")
-            if st.button("Login", use_container_width=True):
-                if pwd == APP_PASSWORD:
-                    st.session_state["authenticated"] = True
-                    st.rerun()
-                else:
-                    st.error("Incorrect password.")
+        pwd = st.text_input("Password", type="password")
+        if st.button("Login", use_container_width=True):
+            if pwd == APP_PASSWORD:
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
         st.stop()
 
-st.title("Drowning Cases Explorer")
-st.caption("Fully offline — powered by Ollama + SQLite")
+st.title("🌊 Drowning Cases Explorer")
+st.caption("Australian drowning incident monitor — powered by Google Gemini + SQLite")
 
 # ── Helpers ───────────────────────────────────────────────────────
 
@@ -57,231 +35,189 @@ def get_conn():
     return sqlite3.connect(DB_PATH)
 
 def db_query(sql, params=()):
-    conn = get_conn()
-    df = pd.read_sql_query(sql, conn, params=params)
-    conn.close()
-    return df
+    try:
+        conn = get_conn()
+        df = pd.read_sql_query(sql, conn, params=params)
+        conn.close()
+        return df
+    except Exception as e:
+        return pd.DataFrame()
 
+def total_cases():
+    try:
+        conn = get_conn()
+        n = conn.execute("SELECT COUNT(*) FROM drowning_cases").fetchone()[0]
+        conn.close()
+        return n
+    except Exception:
+        return 0
+
+# ── Top metrics ───────────────────────────────────────────────────
+total = total_cases()
+
+if total == 0:
+    st.warning("No cases in database yet. Run `python run_pipeline.py` to fetch cases.")
+else:
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total Cases", f"{total:,}")
+
+    fatal = db_query("SELECT COUNT(*) as n FROM drowning_cases WHERE outcome='Fatal'")
+    m2.metric("Fatal", f"{fatal.iloc[0]['n']:,}" if not fatal.empty else "—")
+
+    rescued = db_query("SELECT COUNT(*) as n FROM drowning_cases WHERE outcome='Rescued'")
+    m3.metric("Rescued", f"{rescued.iloc[0]['n']:,}" if not rescued.empty else "—")
+
+    recent = db_query("SELECT COUNT(*) as n FROM drowning_cases WHERE date(date_fetched) = date('now')")
+    m4.metric("Added Today", f"{recent.iloc[0]['n']:,}" if not recent.empty else "—")
+
+st.markdown("---")
 
 # ── Tabs ──────────────────────────────────────────────────────────
+tab1, tab2, tab3 = st.tabs(["🔍 Search Cases", "📊 Insights", "📋 Recent Cases"])
 
-tab1, tab2, tab3, tab4 = st.tabs(["Search", "Search by Content (RAG)", "Insights", "Batch Status"])
 
-
-# ── Tab 1: Search by ID or name ───────────────────────────────────
-
+# ── Tab 1: Search ─────────────────────────────────────────────────
 with tab1:
     st.subheader("Search Cases")
-    col1, col2 = st.columns([3, 1])
+
+    col1, col2, col3 = st.columns([3, 1, 1])
     with col1:
-        query = st.text_input("Case ID or keyword:", placeholder="e.g. 2023-FL-0042 or Lake Tahoe")
+        keyword = st.text_input("Search by location, summary or keyword:", placeholder="e.g. Bondi Beach, river, child")
     with col2:
-        search_btn = st.button("Search", use_container_width=True)
+        state_filter = st.selectbox("State", ["All", "NSW", "QLD", "VIC", "WA", "SA", "TAS", "NT", "ACT", "Unknown"])
+    with col3:
+        outcome_filter = st.selectbox("Outcome", ["All", "Fatal", "Hospitalised", "Rescued", "Missing", "Unknown"])
 
-    if search_btn and query:
-        results = db_query("""
-            SELECT case_id, filename, source, risk_label, risk_score, swim_skill,
-                   victim_age, victim_gender, water_type, location, incident_date, analyzed
-            FROM cases
-            WHERE case_id LIKE ? OR location LIKE ? OR summary LIKE ?
-            ORDER BY incident_date DESC
-            LIMIT 50
-        """, (f"%{query}%", f"%{query}%", f"%{query}%"))
+    where = []
+    params = []
 
-        if results.empty:
-            st.warning("No cases found.")
-        else:
-            st.write(f"{len(results)} result(s)")
-            selected = st.dataframe(
-                results,
-                use_container_width=True,
-                selection_mode="single-row",
-                on_select="rerun",
-                key="search_results"
-            )
+    if keyword:
+        where.append("(location_name LIKE ? OR summary LIKE ? OR activity LIKE ?)")
+        params += [f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"]
+    if state_filter != "All":
+        where.append("state = ?")
+        params.append(state_filter)
+    if outcome_filter != "All":
+        where.append("outcome = ?")
+        params.append(outcome_filter)
 
-            if selected and selected.selection.rows:
-                row_idx = selected.selection.rows[0]
-                case_id = results.iloc[row_idx]["case_id"]
+    where_clause = "WHERE " + " AND ".join(where) if where else ""
 
-                case = db_query("SELECT * FROM cases WHERE case_id=?", (case_id,))
-                if not case.empty:
-                    row = case.iloc[0]
-                    st.divider()
-                    c1, c2 = st.columns(2)
+    results = db_query(f"""
+        SELECT id, date_of_incident, location_name, location_type, state,
+               age_group, gender, outcome, activity, source, summary, url
+        FROM drowning_cases
+        {where_clause}
+        ORDER BY date_fetched DESC
+        LIMIT 100
+    """, params)
 
-                    with c1:
-                        st.markdown(f"### Case: {case_id}")
-                        st.markdown(f"**Source:** {row.get('source', '—')}  |  **Date:** {row.get('incident_date', '—')}")
-                        st.markdown(f"**Location:** {row.get('location', '—')}")
-                        st.markdown(f"**Water type:** {row.get('water_type', '—')}")
-                        st.markdown(f"**Victim:** {row.get('victim_age', '—')} y/o {row.get('victim_gender', '—')}")
-                        st.markdown(f"**Swim skill:** {row.get('swim_skill', '—')}")
-                        risk_color = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(str(row.get("risk_label", "")), "⚪")
-                        st.markdown(f"**Risk:** {risk_color} {row.get('risk_label', '—')} (score: {row.get('risk_score', '—')})")
-                        st.markdown(f"**Risk factors:** {row.get('risk_factors', '—')}")
-
-                    with c2:
-                        if row.get("summary"):
-                            st.markdown("**AI Summary**")
-                            st.info(row["summary"])
-
-                        if row.get("sql_data"):
-                            with st.expander("SQL Server record"):
-                                try:
-                                    st.json(json.loads(row["sql_data"]))
-                                except Exception:
-                                    st.text(row["sql_data"])
-
-                    if row.get("analyzed") == 1 and st.button("Re-analyze this case with Ollama"):
-                        with st.spinner("Re-analyzing..."):
-                            from analyze_reports import PROMPT
-                            text = row.get("raw_text", "")[:5000]
-                            response = ollama.chat(
-                                model=OLLAMA_MODEL,
-                                messages=[{"role": "user", "content": PROMPT.format(text=text)}]
-                            )
-                            st.markdown(response["message"]["content"])
-
-
-# ── Tab 2: RAG — Search by Content ───────────────────────────────
-
-with tab2:
-    st.subheader("Search by Content")
-    st.caption("Ask questions about what's written in the reports — no structured extraction needed.")
-
-    if not RAG_AVAILABLE:
-        st.warning("Vector database not built yet. Run `embed_pdfs.py` first.")
+    if results.empty:
+        st.info("No results found.")
     else:
-        rag_question = st.text_input(
-            "Ask anything about the reports:",
-            placeholder="e.g. Were any victims described as weak swimmers? Any cases involving alcohol?"
+        st.caption(f"{len(results)} result(s)")
+        selected = st.dataframe(
+            results.drop(columns=["summary", "url"]),
+            use_container_width=True,
+            selection_mode="single-row",
+            on_select="rerun",
+            key="search_results"
         )
 
-        if rag_question:
-            with st.spinner("Searching reports..."):
-                try:
-                    answer, sources = rag_ask(rag_question)
-                    st.markdown(answer)
-                    with st.expander(f"Source cases ({len(sources)})"):
-                        for s in sources:
-                            st.markdown(f"- `{s}`")
-                except Exception as e:
-                    st.error(f"RAG query failed: {e}")
-
-        st.divider()
-        st.markdown("**Semantic search** — find cases similar to a description")
-        semantic_q = st.text_input("Describe what you're looking for:", placeholder="e.g. child fell into backyard pool unsupervised")
-        if semantic_q:
-            with st.spinner("Finding similar cases..."):
-                try:
-                    chunks = rag_search(semantic_q, n_results=5)
-                    for chunk in chunks:
-                        with st.expander(f"Case {chunk['case_id']} — {chunk['location']}"):
-                            st.text(chunk["text"])
-                except Exception as e:
-                    st.error(f"Search failed: {e}")
+        if selected and selected.selection.rows:
+            row = results.iloc[selected.selection.rows[0]]
+            st.divider()
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown(f"### {row['location_name']}")
+                st.markdown(f"**Date:** {row['date_of_incident']}  |  **State:** {row['state']}")
+                st.markdown(f"**Location type:** {row['location_type']}")
+                st.markdown(f"**Victim:** {row['age_group']} · {row['gender']}")
+                st.markdown(f"**Activity:** {row['activity']}")
+                outcome_icon = {"Fatal": "🔴", "Hospitalised": "🟡", "Rescued": "🟢", "Missing": "🟠"}.get(row['outcome'], "⚪")
+                st.markdown(f"**Outcome:** {outcome_icon} {row['outcome']}")
+                st.markdown(f"**Source:** {row['source']}")
+                if row['url']:
+                    st.markdown(f"[Read article]({row['url']})")
+            with c2:
+                if row['summary']:
+                    st.markdown("**Summary**")
+                    st.info(row['summary'])
 
 
-# ── Tab 3: Insights ───────────────────────────────────────────────
-
-with tab3:
+# ── Tab 2: Insights ───────────────────────────────────────────────
+with tab2:
     st.subheader("Insights")
 
-    analyzed_count = db_query("SELECT COUNT(*) as n FROM cases WHERE analyzed=1").iloc[0]["n"]
-    if analyzed_count == 0:
-        st.warning("No analyzed cases yet. Run analyze_reports.py first.")
+    if total == 0:
+        st.warning("No data yet.")
     else:
-        st.caption(f"Based on {analyzed_count:,} analyzed cases")
-
         col1, col2 = st.columns(2)
 
         with col1:
-            st.markdown("**Swim Skill Distribution**")
-            skill_df = db_query("""
-                SELECT swim_skill, COUNT(*) as count FROM cases
-                WHERE analyzed=1 AND swim_skill IS NOT NULL
-                GROUP BY swim_skill ORDER BY count DESC
-            """)
-            if not skill_df.empty:
-                fig = px.pie(skill_df, names="swim_skill", values="count", hole=0.4)
+            st.markdown("**Cases by Outcome**")
+            outcome_df = db_query("SELECT outcome, COUNT(*) as count FROM drowning_cases GROUP BY outcome ORDER BY count DESC")
+            if not outcome_df.empty:
+                color_map = {"Fatal": "#e74c3c", "Hospitalised": "#f39c12", "Rescued": "#2ecc71", "Missing": "#e67e22", "Unknown": "#95a5a6"}
+                fig = px.bar(outcome_df, x="outcome", y="count", color="outcome", color_discrete_map=color_map)
+                fig.update_layout(showlegend=False)
                 st.plotly_chart(fig, use_container_width=True)
 
         with col2:
-            st.markdown("**Risk Label Distribution**")
-            risk_df = db_query("""
-                SELECT risk_label, COUNT(*) as count FROM cases
-                WHERE analyzed=1 AND risk_label IS NOT NULL
-                GROUP BY risk_label
-            """)
-            if not risk_df.empty:
-                color_map = {"high": "#e74c3c", "medium": "#f39c12", "low": "#2ecc71"}
-                fig = px.bar(risk_df, x="risk_label", y="count",
-                             color="risk_label", color_discrete_map=color_map)
+            st.markdown("**Cases by Location Type**")
+            loc_df = db_query("SELECT location_type, COUNT(*) as count FROM drowning_cases GROUP BY location_type ORDER BY count DESC")
+            if not loc_df.empty:
+                fig = px.pie(loc_df, names="location_type", values="count", hole=0.4)
                 st.plotly_chart(fig, use_container_width=True)
 
-        st.markdown("**Risk Score by Swim Skill**")
-        combo_df = db_query("""
-            SELECT swim_skill, ROUND(AVG(risk_score), 1) as avg_risk, COUNT(*) as count
-            FROM cases WHERE analyzed=1 AND swim_skill IS NOT NULL
-            GROUP BY swim_skill ORDER BY avg_risk DESC
-        """)
-        if not combo_df.empty:
-            fig = px.bar(combo_df, x="swim_skill", y="avg_risk",
-                         text="count", labels={"avg_risk": "Average Risk Score (1-10)"})
+        col3, col4 = st.columns(2)
+
+        with col3:
+            st.markdown("**Cases by State**")
+            state_df = db_query("SELECT state, COUNT(*) as count FROM drowning_cases GROUP BY state ORDER BY count DESC")
+            if not state_df.empty:
+                fig = px.bar(state_df, x="state", y="count")
+                st.plotly_chart(fig, use_container_width=True)
+
+        with col4:
+            st.markdown("**Cases by Age Group**")
+            age_df = db_query("SELECT age_group, COUNT(*) as count FROM drowning_cases GROUP BY age_group ORDER BY count DESC")
+            if not age_df.empty:
+                fig = px.pie(age_df, names="age_group", values="count", hole=0.4)
+                st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("**Cases by Activity**")
+        act_df = db_query("SELECT activity, COUNT(*) as count FROM drowning_cases WHERE activity IS NOT NULL GROUP BY activity ORDER BY count DESC LIMIT 15")
+        if not act_df.empty:
+            fig = px.bar(act_df, x="activity", y="count")
             st.plotly_chart(fig, use_container_width=True)
 
-        st.markdown("**Risk by Water Type**")
-        water_df = db_query("""
-            SELECT water_type, risk_label, COUNT(*) as count
-            FROM cases WHERE analyzed=1 AND water_type IS NOT NULL
-            GROUP BY water_type, risk_label
+        st.markdown("**Daily Intake (last 30 days)**")
+        daily_df = db_query("""
+            SELECT date(date_fetched) as day, COUNT(*) as count
+            FROM drowning_cases
+            WHERE date_fetched >= date('now', '-30 days')
+            GROUP BY day ORDER BY day ASC
         """)
-        if not water_df.empty:
-            fig = px.bar(water_df, x="water_type", y="count", color="risk_label",
-                         color_discrete_map={"high": "#e74c3c", "medium": "#f39c12", "low": "#2ecc71"},
-                         barmode="stack")
+        if not daily_df.empty:
+            fig = px.bar(daily_df, x="day", y="count")
             st.plotly_chart(fig, use_container_width=True)
 
-        st.markdown("**AI Narrative Summary**")
-        if st.button("Generate summary across all cases"):
-            with st.spinner("Analyzing all cases..."):
-                from summarize import run_summary
-                st.markdown(run_summary())
 
+# ── Tab 3: Recent Cases ───────────────────────────────────────────
+with tab3:
+    st.subheader("Most Recently Added Cases")
 
-# ── Tab 4: Batch Status ───────────────────────────────────────────
-
-with tab4:
-    st.subheader("Batch Processing Status")
-
-    status_df = db_query("""
-        SELECT
-            COUNT(*) as total,
-            SUM(CASE WHEN analyzed=1 THEN 1 ELSE 0 END) as done,
-            SUM(CASE WHEN analyzed=0 THEN 1 ELSE 0 END) as pending,
-            SUM(CASE WHEN analyzed=-1 THEN 1 ELSE 0 END) as failed,
-            SUM(CASE WHEN raw_text='' OR raw_text IS NULL THEN 1 ELSE 0 END) as no_text
-        FROM cases
+    recent_df = db_query("""
+        SELECT date_fetched, date_of_incident, location_name, state,
+               location_type, age_group, gender, outcome, activity, source, url
+        FROM drowning_cases
+        ORDER BY date_fetched DESC
+        LIMIT 50
     """)
 
-    row = status_df.iloc[0]
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total cases", f"{int(row['total']):,}")
-    c2.metric("Analyzed", f"{int(row['done']):,}")
-    c3.metric("Pending", f"{int(row['pending']):,}")
-    c4.metric("Failed / no text", f"{int(row['failed']) + int(row['no_text']):,}")
-
-    if row["total"] > 0:
-        pct = int(row["done"]) / int(row["total"])
-        st.progress(pct, text=f"{pct:.0%} complete")
-
-    st.markdown("**To process the next batch, run in your terminal:**")
-    st.code("python analyze_reports.py", language="bash")
-
-    source_df = db_query("""
-        SELECT source, COUNT(*) as count FROM cases GROUP BY source
-    """)
-    if not source_df.empty:
-        st.markdown("**Cases by source**")
-        st.dataframe(source_df, use_container_width=True, hide_index=True)
+    if recent_df.empty:
+        st.info("No cases yet.")
+    else:
+        st.caption(f"Showing {len(recent_df)} most recent cases")
+        st.dataframe(recent_df, use_container_width=True, hide_index=True)
