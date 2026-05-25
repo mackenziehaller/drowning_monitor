@@ -12,12 +12,12 @@ load_dotenv()
 DB_PATH = os.getenv("DB_PATH", "drowning_cases.db")
 APP_PASSWORD = os.getenv("APP_PASSWORD", "")
 
-st.set_page_config(page_title="Drowning Cases Explorer", layout="wide")
+st.set_page_config(page_title="Drowning Cases Monitor", layout="wide")
 
 # ── Login gate ────────────────────────────────────────────────────
 if APP_PASSWORD:
     if not st.session_state.get("authenticated"):
-        st.title("Drowning Cases Explorer")
+        st.title("Drowning Cases Monitor")
         st.markdown("---")
         pwd = st.text_input("Password", type="password")
         if st.button("Login", use_container_width=True):
@@ -28,155 +28,214 @@ if APP_PASSWORD:
                 st.error("Incorrect password.")
         st.stop()
 
-st.title("🌊 Drowning Cases Explorer")
-st.caption("Australian drowning incident monitor — powered by Google Gemini + SQLite")
-
-# ── Run Pipeline button ───────────────────────────────────────────
-with st.sidebar:
-    st.header("Pipeline")
-    st.caption("Search Google News for new Australian drowning cases from the past 72 hours.")
-    if st.button("🔍 Run Pipeline Now", use_container_width=True, type="primary"):
-        with st.spinner("Searching Google News and classifying cases... this takes 1-2 minutes."):
-            try:
-                result = subprocess.run(
-                    [sys.executable, "run_pipeline.py"],
-                    capture_output=True,
-                    text=True,
-                    cwd=os.path.dirname(os.path.abspath(__file__))
-                )
-                if result.returncode == 0:
-                    st.success("Pipeline complete! Refresh the page to see new cases.")
-                    st.code(result.stdout[-3000:] if len(result.stdout) > 3000 else result.stdout)
-                else:
-                    st.error("Pipeline failed.")
-                    st.code(result.stderr[-3000:] if len(result.stderr) > 3000 else result.stderr)
-            except Exception as e:
-                st.error(f"Could not run pipeline: {e}")
-    st.markdown("---")
-
-# ── Helpers ───────────────────────────────────────────────────────
-
+# ── DB helpers ────────────────────────────────────────────────────
 def get_conn():
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_reviews_table():
+    """Create reviews table if it doesn't exist."""
+    with get_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                case_id INTEGER NOT NULL,
+                reviewer TEXT NOT NULL,
+                approved INTEGER NOT NULL,
+                notes TEXT,
+                reviewed_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        conn.commit()
+
+def get_unreviewed(limit, offset, state_filter, outcome_filter, search_text):
+    where = ["r.id IS NULL"]
+    params = []
+    if state_filter:
+        where.append("c.state = ?")
+        params.append(state_filter)
+    if outcome_filter:
+        where.append("c.outcome = ?")
+        params.append(outcome_filter)
+    if search_text:
+        where.append("(c.location_name LIKE ? OR c.summary LIKE ?)")
+        params += [f"%{search_text}%", f"%{search_text}%"]
+    where_clause = " AND ".join(where)
+    params += [limit, offset]
+    with get_conn() as conn:
+        return conn.execute(f"""
+            SELECT c.* FROM drowning_cases c
+            LEFT JOIN reviews r ON r.case_id = c.id
+            WHERE {where_clause}
+            ORDER BY c.date_fetched DESC
+            LIMIT ? OFFSET ?
+        """, params).fetchall()
+
+def count_unreviewed(state_filter, outcome_filter, search_text):
+    where = ["r.id IS NULL"]
+    params = []
+    if state_filter:
+        where.append("c.state = ?")
+        params.append(state_filter)
+    if outcome_filter:
+        where.append("c.outcome = ?")
+        params.append(outcome_filter)
+    if search_text:
+        where.append("(c.location_name LIKE ? OR c.summary LIKE ?)")
+        params += [f"%{search_text}%", f"%{search_text}%"]
+    where_clause = " AND ".join(where)
+    with get_conn() as conn:
+        return conn.execute(f"""
+            SELECT COUNT(*) FROM drowning_cases c
+            LEFT JOIN reviews r ON r.case_id = c.id
+            WHERE {where_clause}
+        """, params).fetchone()[0]
+
+def save_review(case_id, reviewer, approved, notes):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO reviews (case_id, reviewer, approved, notes) VALUES (?, ?, ?, ?)",
+            (case_id, reviewer, 1 if approved else 0, notes)
+        )
+        conn.commit()
 
 def db_query(sql, params=()):
     try:
-        conn = get_conn()
+        conn = sqlite3.connect(DB_PATH)
         df = pd.read_sql_query(sql, conn, params=params)
         conn.close()
         return df
-    except Exception as e:
+    except Exception:
         return pd.DataFrame()
 
-def total_cases():
-    try:
-        conn = get_conn()
-        n = conn.execute("SELECT COUNT(*) FROM drowning_cases").fetchone()[0]
-        conn.close()
-        return n
-    except Exception:
-        return 0
+init_reviews_table()
 
-# ── Top metrics ───────────────────────────────────────────────────
-total = total_cases()
+# ── Sidebar ───────────────────────────────────────────────────────
+st.sidebar.title("🌊 Drowning Monitor")
 
-if total == 0:
-    st.warning("No cases in database yet. Run `python run_pipeline.py` to fetch cases.")
-else:
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total Cases", f"{total:,}")
+# Run pipeline
+st.sidebar.markdown("### Run Pipeline")
+st.sidebar.caption("Search Google News for new cases from the past 72 hours.")
+if st.sidebar.button("🔍 Search for New Cases", use_container_width=True, type="primary"):
+    with st.sidebar:
+        with st.spinner("Running pipeline... 1-2 minutes"):
+            try:
+                result = subprocess.run(
+                    [sys.executable, "run_pipeline.py"],
+                    capture_output=True, text=True,
+                    cwd=os.path.dirname(os.path.abspath(__file__))
+                )
+                if result.returncode == 0:
+                    st.success("Done! New cases loaded.")
+                    st.rerun()
+                else:
+                    st.error("Pipeline failed.")
+                    st.code(result.stderr[-2000:])
+            except Exception as e:
+                st.error(f"Error: {e}")
 
-    fatal = db_query("SELECT COUNT(*) as n FROM drowning_cases WHERE outcome='Fatal'")
-    m2.metric("Fatal", f"{fatal.iloc[0]['n']:,}" if not fatal.empty else "—")
+st.sidebar.markdown("---")
 
-    rescued = db_query("SELECT COUNT(*) as n FROM drowning_cases WHERE outcome='Rescued'")
-    m3.metric("Rescued", f"{rescued.iloc[0]['n']:,}" if not rescued.empty else "—")
+# Settings
+st.sidebar.markdown("### Settings")
+reviewer = st.sidebar.text_input("Reviewer initials", value="MH")
+batch_size = st.sidebar.slider("Cases per page", 5, 50, 10)
 
-    recent = db_query("SELECT COUNT(*) as n FROM drowning_cases WHERE date(date_fetched) = date('now')")
-    m4.metric("Added Today", f"{recent.iloc[0]['n']:,}" if not recent.empty else "—")
+st.sidebar.markdown("---")
 
-st.markdown("---")
+# Filters
+st.sidebar.markdown("### Filters")
+state_filter = st.sidebar.selectbox("State", ["", "NSW", "QLD", "VIC", "WA", "SA", "TAS", "NT", "ACT", "Unknown"])
+outcome_filter = st.sidebar.selectbox("Outcome", ["", "Fatal", "Hospitalised", "Rescued", "Missing", "Unknown"])
+search_text = st.sidebar.text_input("Search keyword", "")
 
-# ── Tabs ──────────────────────────────────────────────────────────
-tab1, tab2, tab3 = st.tabs(["🔍 Search Cases", "📊 Insights", "📋 Recent Cases"])
+# Pagination
+if "page" not in st.session_state:
+    st.session_state.page = 0
 
+total_unreviewed = count_unreviewed(state_filter or None, outcome_filter or None, search_text or None)
+st.sidebar.markdown(f"**Unreviewed: {total_unreviewed}**")
 
-# ── Tab 1: Search ─────────────────────────────────────────────────
+max_page = max((total_unreviewed - 1) // batch_size, 0)
+col1, col2, col3 = st.sidebar.columns(3)
+if col1.button("⏮️"):
+    st.session_state.page = 0
+if col2.button("◀️") and st.session_state.page > 0:
+    st.session_state.page -= 1
+if col3.button("▶️") and st.session_state.page < max_page:
+    st.session_state.page += 1
+
+st.sidebar.caption(f"Page {st.session_state.page + 1} of {max_page + 1}")
+
+# ── Main tabs ─────────────────────────────────────────────────────
+tab1, tab2 = st.tabs(["📋 Review Cases", "📊 Insights"])
+
+# ── Tab 1: Review ─────────────────────────────────────────────────
 with tab1:
-    st.subheader("Search Cases")
+    st.title("Review Cases")
 
-    col1, col2, col3 = st.columns([3, 1, 1])
-    with col1:
-        keyword = st.text_input("Search by location, summary or keyword:", placeholder="e.g. Bondi Beach, river, child")
-    with col2:
-        state_filter = st.selectbox("State", ["All", "NSW", "QLD", "VIC", "WA", "SA", "TAS", "NT", "ACT", "Unknown"])
-    with col3:
-        outcome_filter = st.selectbox("Outcome", ["All", "Fatal", "Hospitalised", "Rescued", "Missing", "Unknown"])
+    offset = st.session_state.page * batch_size
+    rows = get_unreviewed(
+        batch_size, offset,
+        state_filter or None,
+        outcome_filter or None,
+        search_text or None
+    )
 
-    where = []
-    params = []
-
-    if keyword:
-        where.append("(location_name LIKE ? OR summary LIKE ? OR activity LIKE ?)")
-        params += [f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"]
-    if state_filter != "All":
-        where.append("state = ?")
-        params.append(state_filter)
-    if outcome_filter != "All":
-        where.append("outcome = ?")
-        params.append(outcome_filter)
-
-    where_clause = "WHERE " + " AND ".join(where) if where else ""
-
-    results = db_query(f"""
-        SELECT id, date_of_incident, location_name, location_type, state,
-               age_group, gender, outcome, activity, source, summary, url
-        FROM drowning_cases
-        {where_clause}
-        ORDER BY date_fetched DESC
-        LIMIT 100
-    """, params)
-
-    if results.empty:
-        st.info("No results found.")
+    if not rows:
+        st.success("✅ All caught up — no unreviewed cases with current filters.")
     else:
-        st.caption(f"{len(results)} result(s)")
-        selected = st.dataframe(
-            results.drop(columns=["summary", "url"]),
-            use_container_width=True,
-            selection_mode="single-row",
-            on_select="rerun",
-            key="search_results"
-        )
+        st.caption(f"Showing {len(rows)} of {total_unreviewed} unreviewed cases")
 
-        if selected and selected.selection.rows:
-            row = results.iloc[selected.selection.rows[0]]
-            st.divider()
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown(f"### {row['location_name']}")
-                st.markdown(f"**Date:** {row['date_of_incident']}  |  **State:** {row['state']}")
-                st.markdown(f"**Location type:** {row['location_type']}")
-                st.markdown(f"**Victim:** {row['age_group']} · {row['gender']}")
-                st.markdown(f"**Activity:** {row['activity']}")
-                outcome_icon = {"Fatal": "🔴", "Hospitalised": "🟡", "Rescued": "🟢", "Missing": "🟠"}.get(row['outcome'], "⚪")
-                st.markdown(f"**Outcome:** {outcome_icon} {row['outcome']}")
-                st.markdown(f"**Source:** {row['source']}")
-                if row['url']:
-                    st.markdown(f"[Read article]({row['url']})")
-            with c2:
-                if row['summary']:
-                    st.markdown("**Summary**")
-                    st.info(row['summary'])
+        for row in rows:
+            outcome_icon = {"Fatal": "🔴", "Hospitalised": "🟡", "Rescued": "🟢", "Missing": "🟠"}.get(row["outcome"], "⚪")
+            title = f"{outcome_icon} {row['date_of_incident']} — {row['location_name']} ({row['state']}) — {row['outcome']}"
+
+            with st.expander(title, expanded=True):
+                left, right = st.columns([2, 1])
+
+                with left:
+                    st.markdown(f"**Location:** {row['location_name']} ({row['location_type']}), {row['state']}")
+                    st.markdown(f"**Date:** {row['date_of_incident']}")
+                    st.markdown(f"**Victim:** {row['age_group']} · {row['gender']}")
+                    st.markdown(f"**Activity:** {row['activity']}")
+                    st.markdown(f"**Outcome:** {outcome_icon} {row['outcome']}")
+                    st.markdown(f"**Source:** {row['source']}")
+                    if row["url"]:
+                        st.markdown(f"[Read full article ↗]({row['url']})")
+                    if row["summary"]:
+                        st.info(row["summary"])
+
+                with right:
+                    st.markdown("**Review**")
+                    notes = st.text_input("Notes (optional)", key=f"notes_{row['id']}")
+                    b1, b2 = st.columns(2)
+                    if b1.button("✅ Approve", key=f"approve_{row['id']}", use_container_width=True):
+                        save_review(row["id"], reviewer or "anon", True, notes or "approved")
+                        st.success("Approved!")
+                        st.rerun()
+                    if b2.button("❌ Reject", key=f"reject_{row['id']}", use_container_width=True):
+                        save_review(row["id"], reviewer or "anon", False, notes or "rejected")
+                        st.warning("Rejected.")
+                        st.rerun()
 
 
 # ── Tab 2: Insights ───────────────────────────────────────────────
 with tab2:
-    st.subheader("Insights")
+    st.title("Insights")
 
-    if total == 0:
-        st.warning("No data yet.")
-    else:
+    total = db_query("SELECT COUNT(*) as n FROM drowning_cases").iloc[0]["n"] if not db_query("SELECT COUNT(*) as n FROM drowning_cases").empty else 0
+    approved = db_query("SELECT COUNT(*) as n FROM reviews WHERE approved=1").iloc[0]["n"] if not db_query("SELECT COUNT(*) as n FROM reviews WHERE approved=1").empty else 0
+    rejected = db_query("SELECT COUNT(*) as n FROM reviews WHERE approved=0").iloc[0]["n"] if not db_query("SELECT COUNT(*) as n FROM reviews WHERE approved=0").empty else 0
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total Cases", f"{total:,}")
+    m2.metric("Approved", f"{approved:,}")
+    m3.metric("Rejected", f"{rejected:,}")
+    m4.metric("Pending Review", f"{total - approved - rejected:,}")
+
+    if total > 0:
         col1, col2 = st.columns(2)
 
         with col1:
@@ -211,12 +270,6 @@ with tab2:
                 fig = px.pie(age_df, names="age_group", values="count", hole=0.4)
                 st.plotly_chart(fig, use_container_width=True)
 
-        st.markdown("**Cases by Activity**")
-        act_df = db_query("SELECT activity, COUNT(*) as count FROM drowning_cases WHERE activity IS NOT NULL GROUP BY activity ORDER BY count DESC LIMIT 15")
-        if not act_df.empty:
-            fig = px.bar(act_df, x="activity", y="count")
-            st.plotly_chart(fig, use_container_width=True)
-
         st.markdown("**Daily Intake (last 30 days)**")
         daily_df = db_query("""
             SELECT date(date_fetched) as day, COUNT(*) as count
@@ -227,22 +280,3 @@ with tab2:
         if not daily_df.empty:
             fig = px.bar(daily_df, x="day", y="count")
             st.plotly_chart(fig, use_container_width=True)
-
-
-# ── Tab 3: Recent Cases ───────────────────────────────────────────
-with tab3:
-    st.subheader("Most Recently Added Cases")
-
-    recent_df = db_query("""
-        SELECT date_fetched, date_of_incident, location_name, state,
-               location_type, age_group, gender, outcome, activity, source, url
-        FROM drowning_cases
-        ORDER BY date_fetched DESC
-        LIMIT 50
-    """)
-
-    if recent_df.empty:
-        st.info("No cases yet.")
-    else:
-        st.caption(f"Showing {len(recent_df)} most recent cases")
-        st.dataframe(recent_df, use_container_width=True, hide_index=True)
