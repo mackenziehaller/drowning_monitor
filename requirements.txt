@@ -9,7 +9,6 @@ requests>=2.31.0
 googlenewsdecoder>=0.1.5
 
 # ── Explorer app (app.py) ─────────────────────────────────────────
-vanna[chromadb]
 streamlit
 pdfplumber
 ollama

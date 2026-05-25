@@ -4,7 +4,6 @@ import ollama
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from vanna_setup import vn
 from config import DB_PATH, OLLAMA_MODEL, APP_PASSWORD
 
 # RAG is optional — app still works if chroma_db hasn't been built yet
@@ -66,7 +65,7 @@ def db_query(sql, params=()):
 
 # ── Tabs ──────────────────────────────────────────────────────────
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["Search", "Ask a Question", "Search by Content (RAG)", "Insights", "Batch Status"])
+tab1, tab2, tab3, tab4 = st.tabs(["Search", "Search by Content (RAG)", "Insights", "Batch Status"])
 
 
 # ── Tab 1: Search by ID or name ───────────────────────────────────
@@ -145,40 +144,9 @@ with tab1:
                             st.markdown(response["message"]["content"])
 
 
-# ── Tab 2: Ask a Question ─────────────────────────────────────────
+# ── Tab 2: RAG — Search by Content ───────────────────────────────
 
 with tab2:
-    st.subheader("Ask a Question")
-    st.caption("Ask anything about the cases in plain English.")
-
-    question = st.text_input(
-        "Question:",
-        placeholder="e.g. How many high-risk cases involved children under 10?"
-    )
-
-    if question:
-        with st.spinner("Thinking..."):
-            try:
-                sql, df, fig = vn.ask(question, print_results=False)
-
-                if df is not None and not df.empty:
-                    st.dataframe(df, use_container_width=True)
-                else:
-                    st.warning("No results returned.")
-
-                if fig is not None:
-                    st.plotly_chart(fig, use_container_width=True)
-
-                with st.expander("View generated SQL"):
-                    st.code(sql, language="sql")
-
-            except Exception as e:
-                st.error(f"Could not generate answer: {e}")
-
-
-# ── Tab 3: RAG — Search by Content ───────────────────────────────
-
-with tab3:
     st.subheader("Search by Content")
     st.caption("Ask questions about what's written in the reports — no structured extraction needed.")
 
@@ -215,9 +183,9 @@ with tab3:
                     st.error(f"Search failed: {e}")
 
 
-# ── Tab 4: Insights ───────────────────────────────────────────────
+# ── Tab 3: Insights ───────────────────────────────────────────────
 
-with tab4:
+with tab3:
     st.subheader("Insights")
 
     analyzed_count = db_query("SELECT COUNT(*) as n FROM cases WHERE analyzed=1").iloc[0]["n"]
@@ -282,9 +250,9 @@ with tab4:
                 st.markdown(run_summary())
 
 
-# ── Tab 5: Batch Status ───────────────────────────────────────────
+# ── Tab 4: Batch Status ───────────────────────────────────────────
 
-with tab5:
+with tab4:
     st.subheader("Batch Processing Status")
 
     status_df = db_query("""
